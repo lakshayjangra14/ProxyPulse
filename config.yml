@@ -5,3 +5,7 @@ proxy:
 upstream:
   base_url: "http://localhost:9000"
   timeout: 10
+
+cache:
+  redis_url: "redis://localhost:6379"
+  default_ttl: 60
