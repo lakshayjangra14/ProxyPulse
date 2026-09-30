@@ -3,9 +3,28 @@ proxy:
   port: 8080
 
 upstream:
-  base_url: "http://localhost:9000"
+  backends:
+    - url: "http://localhost:9000"
+      weight: 2
+    - url: "http://localhost:9001"
+      weight: 1
   timeout: 10
+  failure_threshold: 3
+  recovery_timeout: 15
 
 cache:
   redis_url: "redis://localhost:6379"
   default_ttl: 60
+
+rate_limit:
+  max_requests: 100
+  window_seconds: 60
+
+circuit_breaker:
+  failure_threshold: 5
+  recovery_timeout: 30
+
+retry:
+  max_retries: 3
+  base_delay: 0.5
+  max_delay: 10.0
