@@ -8,6 +8,7 @@ from src.circuit_breaker import CircuitBreaker
 from src.retry import RetryPolicy
 from src.logger import RequestLogger, setup_logger
 from src.load_balancer import LoadBalancer, NoHealthyBackendError
+from src.health_checker import HealthChecker
 
 
 # Headers that should NOT be forwarded between proxy and backend
@@ -129,9 +130,32 @@ async def proxy_handler(request):
     cb_allowed, cb_state = breaker.allow_request()
 
     if not cb_allowed:
-        # Circuit is OPEN — fail fast
-        if request.method == 'GET' and coalescer.is_in_flight(cache_key):
-            coalescer.reject(cache_key, Exception('circuit open'))
+        # Circuit is OPEN — try stale cache before failing fast
+        if request.method == 'GET':
+            stale = await cache.get_stale(cache_key)
+            if stale:
+                response_headers = stale['headers']
+                response_headers['X-Proxy'] = 'ProxyPulse'
+                response_headers['X-Cache'] = 'STALE'
+                response_headers['X-Circuit'] = breaker.state.value
+                response_headers.update(rate_limit_headers)
+                latency = (time.monotonic() - request_start) * 1000
+                req_logger.log_request(
+                    client_ip=client_ip, method=request.method, path=request.path,
+                    status=stale['status'], latency_ms=latency, cache_status='STALE',
+                    circuit_state='OPEN'
+                )
+                if coalescer.is_in_flight(cache_key):
+                    coalescer.resolve(cache_key, stale)
+                return web.Response(
+                    body=stale['body'],
+                    status=stale['status'],
+                    headers=response_headers
+                )
+            # No stale cache — reject waiters
+            if coalescer.is_in_flight(cache_key):
+                coalescer.reject(cache_key, Exception('circuit open'))
+
         latency = (time.monotonic() - request_start) * 1000
         req_logger.log_request(
             client_ip=client_ip, method=request.method, path=request.path,
@@ -229,14 +253,37 @@ async def proxy_handler(request):
         breaker.record_failure()
         if lb and backend:
             lb.record_failure(backend)
+
+        # --- Stale-cache fallback: serve expired cache when upstream is down ---
+        if request.method == 'GET':
+            stale = await cache.get_stale(cache_key)
+            if stale:
+                response_headers = stale['headers']
+                response_headers['X-Proxy'] = 'ProxyPulse'
+                response_headers['X-Cache'] = 'STALE'
+                response_headers['X-Circuit'] = breaker.state.value
+                response_headers.update(rate_limit_headers)
+                latency = (time.monotonic() - request_start) * 1000
+                req_logger.log_request(
+                    client_ip=client_ip, method=request.method, path=request.path,
+                    status=stale['status'], latency_ms=latency, cache_status='STALE',
+                    circuit_state=breaker.state.value, error=e
+                )
+                coalescer.resolve(cache_key, stale)
+                return web.Response(
+                    body=stale['body'],
+                    status=stale['status'],
+                    headers=response_headers
+                )
+            # No stale cache available — reject waiters and re-raise
+            coalescer.reject(cache_key, e)
+
         latency = (time.monotonic() - request_start) * 1000
         req_logger.log_request(
             client_ip=client_ip, method=request.method, path=request.path,
             status=502, latency_ms=latency, circuit_state=breaker.state.value,
             error=e
         )
-        if request.method == 'GET':
-            coalescer.reject(cache_key, e)
         raise
 
 
@@ -277,8 +324,16 @@ async def client_session_ctx(app):
         # Set base_url fallback for cache key generation etc.
         config['upstream'].setdefault('base_url', upstream_cfg['backends'][0]['url'])
 
+        # Active health checker — probes backends in the background
+        hc = HealthChecker(app['load_balancer'])
+        app['health_checker'] = hc
+        await hc.start()
+
     yield
 
+    # Shutdown
+    if 'health_checker' in app:
+        await app['health_checker'].stop()
     await app['cache'].close()
     await app['client_session'].close()
 
@@ -292,7 +347,7 @@ def create_app():
     # Lifecycle: create/destroy the HTTP client session
     app.cleanup_ctx.append(client_session_ctx)
     
-    # Status endpoint — check circuit breaker state
+    # Status endpoint — full system state
     async def status_handler(request):
         breaker = request.app['circuit_breaker']
         req_logger = request.app['request_logger']
@@ -305,9 +360,18 @@ def create_app():
         lb = request.app.get('load_balancer')
         if lb:
             resp['load_balancer'] = lb.stats
+        hc = request.app.get('health_checker')
+        if hc:
+            resp['health_checker'] = hc.stats
         return web.json_response(resp)
 
+    # /metrics — lightweight observability endpoint (resume requirement)
+    async def metrics_handler(request):
+        req_logger = request.app['request_logger']
+        return web.json_response(req_logger.stats)
+
     app.router.add_get('/_proxy/status', status_handler)
+    app.router.add_get('/metrics', metrics_handler)
 
     # Catch-all route: any method, any path → proxy_handler
     app.router.add_route('*', '/{path_info:.*}', proxy_handler)

@@ -65,6 +65,8 @@ class RequestLogger:
         self._status_counts = {}
         self._cache_hits = 0
         self._cache_misses = 0
+        self._coalesced_count = 0
+        self._stale_serves = 0
         self._total_latency = 0.0
 
     def log_request(self, *, client_ip, method, path, status, latency_ms,
@@ -79,6 +81,10 @@ class RequestLogger:
             self._cache_hits += 1
         elif cache_status == "MISS":
             self._cache_misses += 1
+        elif cache_status == "COALESCED":
+            self._coalesced_count += 1
+        elif cache_status == "STALE":
+            self._stale_serves += 1
 
         extra = {
             "type": "request",
@@ -122,6 +128,8 @@ class RequestLogger:
             "cache_hit_ratio": round(
                 self._cache_hits / max(self._cache_hits + self._cache_misses, 1), 3
             ),
+            "coalesced_requests": self._coalesced_count,
+            "stale_serves": self._stale_serves,
             "avg_latency_ms": round(
                 self._total_latency / max(total, 1), 2
             ),
